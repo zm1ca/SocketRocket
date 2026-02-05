@@ -10,17 +10,13 @@ let package = Package(
             targets: ["SocketRocket"]
         ),
     ],
-    dependencies: [
-        // Dependencies declare other packages that this package depends on.
-        // .package(url: /* package url */, from: "1.0.0"),
-    ],
     targets: [
         .target(
             name: "SocketRocket",
             path: "SocketRocket",
-            exclude: ["Resources"], // Исключите ненужные файлы или директории
-            sources: [".", "Internal"], // Указание исходных файлов
-            publicHeadersPath: "include", // Все публичные заголовки должны быть перемещены в 'include'
+            exclude: ["Resources"],
+            sources: [".", "Internal"],
+            publicHeadersPath: "include",
             cSettings: [
                 .headerSearchPath("."),
                 .headerSearchPath("Internal"),

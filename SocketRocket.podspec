@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name               = 'SocketRocket'
-  s.version            = '0.7.1'
+  s.version            = '0.7.0'
   s.summary            = 'A conforming WebSocket (RFC 6455) client library for iOS, macOS and tvOS.'
   s.homepage           = 'https://github.com/facebook/SocketRocket'
   s.authors            = { 'Nikita Lutsenko' => 'nlutsenko@me.com', 'Dan Federman' => 'federman@squareup.com', 'Mike Lewis' => 'mikelikespie@gmail.com' }
@@ -14,7 +14,6 @@ Pod::Spec.new do |s|
   s.ios.deployment_target  = '11.0'
   s.osx.deployment_target  = '10.13'
   s.tvos.deployment_target = '11.0'
-  s.visionos.deployment_target = '1.0'
 
   s.ios.frameworks     = 'CFNetwork', 'Security'
   s.osx.frameworks     = 'CoreServices', 'Security'

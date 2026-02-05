@@ -19,7 +19,7 @@
 #import <unicode/utf8.h>
 #endif
 
-#import <os/lock.h>
+#import <libkern/OSAtomic.h>
 
 #import "SRDelegateController.h"
 #import "SRIOConsumer.h"
@@ -66,9 +66,6 @@ static inline int32_t validate_dispatch_data_partial_string(NSData *data);
 
 static uint8_t const SRWebSocketProtocolVersion = 13;
 
-// Max frame payload length for all frames is 256MB, which is reasonable max.
-static const uint32_t SRWebSocketMaxFramePayloadLength = 256 * 1024 * 1024;
-
 NSString *const SRWebSocketErrorDomain = @"SRWebSocketErrorDomain";
 NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
@@ -88,7 +85,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
 @implementation SRWebSocket {
     SRMutex _kvoLock;
-    os_unfair_lock _propertyLock;
+    OSSpinLock _propertyLock;
 
     dispatch_queue_t _workQueue;
     NSMutableArray<SRIOConsumer *> *_consumers;
@@ -163,7 +160,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
     _readyState = SR_CONNECTING;
 
-    _propertyLock = OS_UNFAIR_LOCK_INIT;
+    _propertyLock = OS_SPINLOCK_INIT;
     _kvoLock = SRMutexInitRecursive();
     _workQueue = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
 
@@ -283,9 +280,9 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
         SRMutexLock(_kvoLock);
         if (_readyState != readyState) {
             [self willChangeValueForKey:@"readyState"];
-            os_unfair_lock_lock(&_propertyLock);
+            OSSpinLockLock(&_propertyLock);
             _readyState = readyState;
-            os_unfair_lock_unlock(&_propertyLock);
+            OSSpinLockUnlock(&_propertyLock);
             [self didChangeValueForKey:@"readyState"];
         }
     }
@@ -297,9 +294,9 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 - (SRReadyState)readyState
 {
     SRReadyState state = 0;
-    os_unfair_lock_lock(&_propertyLock);
+    OSSpinLockLock(&_propertyLock);
     state = _readyState;
-    os_unfair_lock_unlock(&_propertyLock);
+    OSSpinLockUnlock(&_propertyLock);
     return state;
 }
 
@@ -313,12 +310,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
 - (void)open
 {
-    NSURL* const url = _url;
-    if (!url) {
-        NSError *error = SRErrorWithDomainCodeDescription(NSURLErrorDomain, NSURLErrorBadURL, @"Unable to open socket with emtpy URL.");
-        [self _failWithError:error];
-        return;
-    }
+    assert(_url);
     NSAssert(self.readyState == SR_CONNECTING, @"Cannot call -(void)open on SRWebSocket more than once.");
 
     _selfRetain = self;
@@ -338,7 +330,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
         });
     }
 
-    _proxyConnect = [[SRProxyConnect alloc] initWithURL:url];
+    _proxyConnect = [[SRProxyConnect alloc] initWithURL:_url];
 
     __weak typeof(self) wself = self;
     [_proxyConnect openNetworkStreamWithCompletion:^(NSError *error, NSInputStream *readStream, NSOutputStream *writeStream) {
@@ -391,9 +383,9 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
     return [acceptHeader isEqualToString:expectedAccept];
 }
 
-- (void)_HTTPHeadersDidFinish:(CFHTTPMessageRef)httpMessage
+- (void)_HTTPHeadersDidFinish
 {
-    NSInteger responseCode = CFHTTPMessageGetResponseStatusCode(httpMessage);
+    NSInteger responseCode = CFHTTPMessageGetResponseStatusCode(_receivedHTTPHeaders);
     if (responseCode >= 400) {
         SRDebugLog(@"Request failed with response code %d", responseCode);
         NSError *error = SRHTTPErrorWithCodeDescription(responseCode, 2132,
@@ -403,13 +395,13 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
         return;
     }
 
-    if(![self _checkHandshake:httpMessage]) {
+    if(![self _checkHandshake:_receivedHTTPHeaders]) {
         NSError *error = SRErrorWithCodeDescription(2133, @"Invalid Sec-WebSocket-Accept response.");
         [self _failWithError:error];
         return;
     }
 
-    NSString *negotiatedProtocol = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(httpMessage, CFSTR("Sec-WebSocket-Protocol")));
+    NSString *negotiatedProtocol = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(_receivedHTTPHeaders, CFSTR("Sec-WebSocket-Protocol")));
     if (negotiatedProtocol) {
         // Make sure we requested the protocol
         if ([_requestedProtocols indexOfObject:negotiatedProtocol] == NSNotFound) {
@@ -451,7 +443,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
         if (CFHTTPMessageIsHeaderComplete(receivedHTTPHeaders)) {
             SRDebugLog(@"Finished reading headers %@", CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(receivedHTTPHeaders)));
-            [socket _HTTPHeadersDidFinish:receivedHTTPHeaders];
+            [socket _HTTPHeadersDidFinish];
         } else {
             [socket _readHTTPHeader];
         }
@@ -620,7 +612,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
     if (!message) {
         [self sendData:nil error:nil]; // Send Data, but it doesn't matter since we are going to send the same text frame with 0 length.
     } else if ([message isKindOfClass:[NSString class]]) {
-        [self sendString:(NSString *_Nonnull)message error:nil];
+        [self sendString:message error:nil];
     } else if ([message isKindOfClass:[NSData class]]) {
         [self sendData:message error:nil];
     } else {
@@ -775,7 +767,7 @@ static inline BOOL closeCodeIsValid(int closeCode) {
             }
         }
     } else {
-        _closeCode = SRStatusCodeNoStatusReceived;
+        _closeCode = SRStatusNoStatusReceived;
     }
 
     [self assertOnWorkQueue];
@@ -910,10 +902,7 @@ static inline BOOL closeCodeIsValid(int closeCode) {
             }
         }
     } else {
-        if (frame_header.payload_length > SRWebSocketMaxFramePayloadLength) {
-            [self _closeWithProtocolError:@"Payload length too large."];
-            return;
-        }
+        assert(frame_header.payload_length <= SIZE_T_MAX);
         [self _addConsumerWithDataLength:(size_t)frame_header.payload_length callback:^(SRWebSocket *sself, NSData *newData) {
             if (isControlFrame) {
                 [sself _handleFrameWithData:newData opCode:frame_header.opcode];
@@ -1120,7 +1109,6 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
         }
 
         if (!_failed) {
-            self.readyState = SR_CLOSED;
             [self.delegateController performDelegateBlock:^(id<SRWebSocketDelegate>  _Nullable delegate, SRDelegateAvailableMethods availableMethods) {
                 if (availableMethods.didCloseWithCode) {
                     [delegate webSocket:self didCloseWithCode:self->_closeCode reason:self->_closeReason wasClean:YES];
@@ -1406,7 +1394,7 @@ static const size_t SRFrameHeaderOverhead = 32;
 
     const uint8_t *unmaskedPayloadBuffer = (uint8_t *)data.bytes;
     uint8_t *maskKey = frameBuffer + frameBufferSize;
-
+    
     size_t randomBytesSize = sizeof(uint32_t);
     NSData *randomData = SRRandomData(randomBytesSize);
     [randomData getBytes:maskKey range:NSMakeRange(0, randomBytesSize)];
@@ -1433,17 +1421,7 @@ static const size_t SRFrameHeaderOverhead = 32;
         (eventCode == NSStreamEventHasBytesAvailable || eventCode == NSStreamEventHasSpaceAvailable)) {
         SecTrustRef trust = (__bridge SecTrustRef)[aStream propertyForKey:(__bridge id)kCFStreamPropertySSLPeerTrust];
         if (trust) {
-            NSString *const host = _urlRequest.URL.host;
-            if (!host || host.length == 0) {
-                dispatch_async(_workQueue, ^{
-                    NSError *error = SRErrorWithDomainCodeDescription(NSURLErrorDomain,
-                                                                      NSURLErrorBadURL,
-                                                                      @"Unable to validate certificate for empty host.");
-                    [wself _failWithError:error];
-                });
-                return;
-            }
-            _streamSecurityValidated = [_securityPolicy evaluateServerTrust:trust forDomain:host];
+            _streamSecurityValidated = [_securityPolicy evaluateServerTrust:trust forDomain:_urlRequest.URL.host];
         }
         if (!_streamSecurityValidated) {
             dispatch_async(_workQueue, ^{
